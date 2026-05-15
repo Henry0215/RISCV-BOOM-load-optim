@@ -137,7 +137,6 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
 
   // Speculatively tell the IQs that we'll get load data back next cycle
   val spec_ld_wakeup = Output(Vec(memWidth, Valid(UInt(maxPregSz.W))))
-  val spec_ld_wakeup_is_retry = Output(Vec(memWidth, Bool()))
   // Tell the IQs that the load we speculated last cycle was misspeculated
   val ld_miss      = Output(Bool())
 
@@ -163,26 +162,6 @@ class LSUCoreIO(implicit p: Parameters) extends BoomBundle()(p)
   val dtlb_miss_num     = Output(UInt(4.W))
   val dcache_valid_access  = Output(UInt(4.W))
   val dcache_nack_num      = Output(UInt(4.W))
-  
-  // CMAP update signals (from LSU to core)
-  val cmap_update_valid       = Output(Vec(memWidth, Bool()))
-  val cmap_update_lreg        = Output(Vec(memWidth, UInt(log2Ceil(32).W)))
-  val cmap_update_base        = Output(Vec(memWidth, UInt(vaddrBitsExtended.W)))  // Base register value (vaddr - imm)
-  val cmap_update_seq         = Output(Vec(memWidth, UInt(8.W)))  // Sequence number for ABA prevention (16-bit to avoid overflow)
-  
-  // CMAP clear processing signal (for uncacheable addresses)
-  // When TLB returns uncacheable, clear processing bit without updating CMAP data
-  val cmap_clear_processing_valid = Output(Vec(memWidth, Bool()))
-  val cmap_clear_processing_lreg  = Output(Vec(memWidth, UInt(log2Ceil(32).W)))
-  val cmap_clear_processing_seq   = Output(Vec(memWidth, UInt(8.W)))
-  
-  // CMAP invalidation signal (kept for compatibility, but no longer needed for TLB/VM events)
-  val cmap_invalidate_all     = Output(Bool())
-  
-  // CMAP performance counters
-  val cmap_fast_translate_cnt = Output(Vec(coreWidth, Bool()))  // Loads with CMAP prediction (for debug counting)
-  val cmap_load_update_cnt = Output(Vec(memWidth, Bool()))      // Load CMAP updates
-  
 }
 
 class LSUIO(implicit p: Parameters, edge: TLEdgeOut) extends BoomBundle()(p)
@@ -291,19 +270,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val dcache_nack = widthMap(w => io.dmem.nack(w).valid && (io.dmem.nack(w).bits.uop.uses_ldq || io.dmem.nack(w).bits.uop.uses_stq))
   io.core.dcache_nack_num     := PopCount(dcache_nack.asUInt)
 
-  //-------------------------------------------------------------
-  // CMAP Update Interface - Initialize to default values
-  //-------------------------------------------------------------
-  for (w <- 0 until memWidth) {
-    io.core.cmap_update_valid(w) := false.B
-    io.core.cmap_update_lreg(w) := 0.U
-    io.core.cmap_update_base(w) := 0.U
-    io.core.cmap_update_seq(w) := 0.U
-    // Clear processing signals (for uncacheable)
-    io.core.cmap_clear_processing_valid(w) := false.B
-    io.core.cmap_clear_processing_lreg(w) := 0.U
-    io.core.cmap_clear_processing_seq(w) := 0.U
-  }
 
   val clear_store     = WireInit(false.B)
   val live_store_mask = RegInit(0.U(numStqEntries.W))
@@ -357,18 +323,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ld_enq_idx).bits.youngest_stq_idx  := st_enq_idx
       ldq(ld_enq_idx).bits.st_dep_mask     := next_live_store_mask
 
-      // CMAP fast address translation: If physical address already computed at decode
-      when (io.core.dis_uops(w).bits.cmap_addr_ready) {
-        ldq(ld_enq_idx).bits.addr.valid      := true.B
-        ldq(ld_enq_idx).bits.addr.bits       := io.core.dis_uops(w).bits.cmap_vaddr
-        ldq(ld_enq_idx).bits.addr_is_virtual := true.B  // It's a vaddr, still needs TLB
-        ldq(ld_enq_idx).bits.addr_is_uncacheable := false.B
-      } .otherwise {
-        ldq(ld_enq_idx).bits.addr.valid      := false.B
-        ldq(ld_enq_idx).bits.addr_is_virtual := true.B
-        ldq(ld_enq_idx).bits.addr_is_uncacheable := false.B
-      }
-      
+      ldq(ld_enq_idx).bits.addr.valid      := false.B
       ldq(ld_enq_idx).bits.executed        := false.B
       ldq(ld_enq_idx).bits.succeeded       := false.B
       ldq(ld_enq_idx).bits.order_fail      := false.B
@@ -382,12 +337,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     {
       stq(st_enq_idx).valid           := true.B
       stq(st_enq_idx).bits.uop        := io.core.dis_uops(w).bits
-      
-      // CMAP Debug Mode: Store also goes through normal TLB path
-      // (Store doesn't use CMAP anyway in current design, just keep it simple)
-      stq(st_enq_idx).bits.addr.valid      := false.B
-      stq(st_enq_idx).bits.addr_is_virtual := true.B
-      
+      stq(st_enq_idx).bits.addr.valid := false.B
       stq(st_enq_idx).bits.data.valid := false.B
       stq(st_enq_idx).bits.committed  := false.B
       stq(st_enq_idx).bits.succeeded  := false.B
@@ -405,14 +355,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
                                  st_enq_idx)
 
     assert(!(dis_ld_val && dis_st_val), "A UOP is trying to go into both the LDQ and the STQ")
-  }
-  
-  // CMAP debug: Count loads with CMAP prediction (even though we verify via TLB in debug mode)
-  for (w <- 0 until coreWidth) {
-    io.core.cmap_fast_translate_cnt(w) := io.core.dis_uops(w).valid && 
-                                           io.core.dis_uops(w).bits.cmap_addr_ready &&
-                                           !io.core.dis_uops(w).bits.exception &&
-                                           io.core.dis_uops(w).bits.uses_ldq  // Only count Loads, not Stores
   }
 
   ldq_tail := ld_enq_idx
@@ -534,15 +476,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val can_fire_release       = widthMap(w => (w == memWidth-1).B && io.dmem.release.valid)
   io.dmem.release.ready     := will_fire_release.reduce(_||_)
 
-  // // SAB conflict gating: if the selected retry load has sab_conflict set,
-  // // wait until the conflicting store's physical address is resolved or the
-  // // store entry is deallocated. This is done at can_fire level (not in the
-  // // AgePriorityEncoder selector) to avoid potential deadlock from STQ index reuse.
-  // val ldq_retry_sab_stq_idx = ldq_retry_e.bits.uop.sab_conflict_stq_idx
-  // val ldq_retry_sab_store_ready = !ldq_retry_e.bits.uop.sab_conflict ||
-  //   !stq(ldq_retry_sab_stq_idx).valid ||
-  //   (stq(ldq_retry_sab_stq_idx).bits.addr.valid && !stq(ldq_retry_sab_stq_idx).bits.addr_is_virtual)
-
   // Can we retry a load that missed in the TLB
   val can_fire_load_retry    = widthMap(w =>
                                ( ldq_retry_e.valid                            &&
@@ -658,13 +591,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     }
     exe_tlb_valid(w) := !tlb_avail
   }
-  
-  // CMAP invalidation: since CMAP now caches vaddr (not paddr), 
-  // TLB miss, sfence, and VM state changes do NOT require CMAP invalidation.
-  // Only structural events (mispredict/rollback/flush) handled in core.scala matter.
-  // Keep the signal for compatibility but always false.
-  io.core.cmap_invalidate_all := false.B
-  
   assert((memWidth == 1).B ||
     (!(will_fire_sfence.reduce(_||_) && !will_fire_sfence.reduce(_&&_)) &&
      !will_fire_hella_incoming.reduce(_&&_) &&
@@ -746,20 +672,8 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   dtlb.io.sfence                    := exe_sfence
 
   // exceptions
-  // CMAP bypass loads skip MemAddrCalc (exe_unit), so they have no exe_req.bits.mxcpt.
-  // For load_retry path (used by CMAP bypass), we must check misalignment directly here.
-  // The check mirrors MemAddrCalcUnit: misaligned if (vaddr & (size_mask)) != 0
-  val retry_misaligned = widthMap(w => {
-    val size = exe_size(w)
-    val vaddr = exe_tlb_vaddr(w)
-    (size === 1.U && (vaddr(0) =/= 0.U)) ||
-    (size === 2.U && (vaddr(1,0) =/= 0.U)) ||
-    (size === 3.U && (vaddr(2,0) =/= 0.U))
-  })
-  val ma_ld = widthMap(w =>
-    (will_fire_load_incoming(w) && exe_req(w).bits.mxcpt.valid) ||  // Normal path: from MemAddrCalc
-    (will_fire_load_retry(w) && retry_misaligned(w)))               // CMAP bypass path: check here
-  val ma_st = widthMap(w => (will_fire_sta_incoming(w) || will_fire_stad_incoming(w)) && exe_req(w).bits.mxcpt.valid)
+  val ma_ld = widthMap(w => will_fire_load_incoming(w) && exe_req(w).bits.mxcpt.valid) // We get ma_ld in memaddrcalc
+  val ma_st = widthMap(w => (will_fire_sta_incoming(w) || will_fire_stad_incoming(w)) && exe_req(w).bits.mxcpt.valid) // We get ma_ld in memaddrcalc
   val pf_ld = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).pf.ld && exe_tlb_uop(w).uses_ldq)
   val pf_st = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).pf.st && exe_tlb_uop(w).uses_stq)
   val ae_ld = widthMap(w => dtlb.io.req(w).valid && dtlb.io.resp(w).ae.ld && exe_tlb_uop(w).uses_ldq)
@@ -875,8 +789,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       s0_executing_loads(ldq_incoming_idx(w)) := dmem_req_fire(w)
       assert(!ldq_incoming_e(w).bits.executed)
     } .elsewhen (will_fire_load_retry(w)) {
-      // CMAP bypass: also block misaligned loads from reaching dcache
-      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w) && !retry_misaligned(w)
+      dmem_req(w).valid      := !exe_tlb_miss(w) && !exe_tlb_uncacheable(w)
       dmem_req(w).bits.addr  := exe_tlb_paddr(w)
       dmem_req(w).bits.uop   := exe_tlb_uop(w)
 
@@ -945,33 +858,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(ldq_idx).bits.uop.pdst            := exe_tlb_uop(w).pdst
       ldq(ldq_idx).bits.addr_is_virtual     := exe_tlb_miss(w)
       ldq(ldq_idx).bits.addr_is_uncacheable := exe_tlb_uncacheable(w) && !exe_tlb_miss(w)
-      
+
       assert(!(will_fire_load_incoming(w) && ldq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming load is overwriting a valid address")
-
-      
-      // CMAP Update: Load completed AGU + TLB translation successfully
-      // Update CMAP with the AGU-computed vaddr (not paddr)
-      // Only update if cmap_will_update is set (entry was marked for update at decode)
-      // Note: With vaddr-based CMAP, we don't need to check cacheable/special_entry
-      //       because vaddr is independent of memory region properties
-      // CRITICAL: Do NOT update CMAP if the load is being killed by branch mispredict
-      // or pipeline flush! A killed/flushed load's result should not pollute CMAP:
-      //   1. The register mapping may have been rolled back
-      //   2. A younger instruction may use the same logical register with different value
-      val load_is_killed = IsKilledByBranch(io.core.brupdate, exe_tlb_uop(w)) || 
-                           io.core.brupdate.b1.cmap_flush ||
-                           io.core.exception
-      when (exe_tlb_uop(w).cmap_will_update && !load_is_killed) {
-        // Update CMAP with vaddr from AGU (exe_tlb_vaddr is always valid, even on TLB miss)
-        io.core.cmap_update_valid(w) := true.B
-        io.core.cmap_update_lreg(w) := exe_tlb_uop(w).lrs1
-        // Compute base register value: base = vaddr - sign_extend(imm)
-        // This avoids storing imm separately and eliminates a subtractor in the decode prediction path
-        val load_imm = exe_tlb_uop(w).imm_packed(19, 8)
-        io.core.cmap_update_base(w) := exe_tlb_vaddr(w) - Cat(Fill(vaddrBitsExtended - 12, load_imm(11)), load_imm)
-        io.core.cmap_update_seq(w) := exe_tlb_uop(w).cmap_seq
-      }
     }
 
     when (will_fire_sta_incoming(w) || will_fire_stad_incoming(w) || will_fire_sta_retry(w))
@@ -987,22 +876,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       assert(!(will_fire_sta_incoming(w) && stq_incoming_e(w).bits.addr.valid),
         "[lsu] Incoming store is overwriting a valid address")
 
-      // CMAP Update: STA completed AGU + TLB translation successfully
-      // Update CMAP with the AGU-computed vaddr, same as Load writeback.
-      // Since memWidth=1, Load and STA never fire in the same cycle,
-      // so they can safely share the cmap_update port without conflict.
-      // Covers both incoming and retry paths (like Load does).
-      val sta_is_killed = IsKilledByBranch(io.core.brupdate, exe_tlb_uop(w)) ||
-                          io.core.brupdate.b1.cmap_flush ||
-                          io.core.exception
-      when (exe_tlb_uop(w).cmap_will_update && !sta_is_killed) {
-        io.core.cmap_update_valid(w) := true.B
-        io.core.cmap_update_lreg(w) := exe_tlb_uop(w).lrs1
-        // Compute base register value: base = vaddr - sign_extend(imm)
-        val sta_imm = exe_tlb_uop(w).imm_packed(19, 8)
-        io.core.cmap_update_base(w) := exe_tlb_vaddr(w) - Cat(Fill(vaddrBitsExtended - 12, sta_imm(11)), sta_imm)
-        io.core.cmap_update_seq(w) := exe_tlb_uop(w).cmap_seq
-      }
     }
 
     //-------------------------------------------------------------
@@ -1070,12 +943,6 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val mem_tlb_miss             = RegNext(exe_tlb_miss)
   val mem_tlb_uncacheable      = RegNext(exe_tlb_uncacheable)
   val mem_paddr                = RegNext(widthMap(w => dmem_req(w).bits.addr))
-  
-  // CMAP load/store updates
-  for (w <- 0 until memWidth) {
-    io.core.cmap_load_update_cnt(w) := (will_fire_load_incoming(w) || will_fire_sta_incoming(w) || will_fire_stad_incoming(w)) &&
-                                        !exe_tlb_miss(w) && exe_tlb_uop(w).cmap_will_update
-  }
 
   // Task 1: Clr ROB busy bit
   val clr_bsy_valid   = RegInit(widthMap(w => false.B))
@@ -1297,7 +1164,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     val write_mask = GenByteMask(s_addr, s_uop.mem_size)
     for (w <- 0 until memWidth) {
       when (do_ld_search(w) && stq(i).valid && lcam_st_dep_mask(w)(i)) {
-        when (((lcam_mask(w) & write_mask) === lcam_mask(w)) && !s_uop.is_fence && !s_uop.is_amo && dword_addr_matches(w) && can_forward(w))
+        when (((lcam_mask(w) & write_mask) === lcam_mask(w)) && !s_uop.is_fence && dword_addr_matches(w) && can_forward(w))
         {
           ldst_addr_matches(w)(i)            := true.B
           ldst_forward_matches(w)(i)         := true.B
@@ -1356,7 +1223,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
     when (will_fire_store_commit(0) || !can_fire_store_commit(0)) {
       store_blocked_counter := 0.U
     } .elsewhen (can_fire_store_commit(0) && !will_fire_store_commit(0)) {
-      store_blocked_counter := Mux(store_blocked_counter === 15.U, 15.U, store_blocked_counter + 1.U)
+      store_blocked_counter := Mux(store_blocked_counter === 15.U, store_blocked_counter + 1.U, 15.U)
     }
     when (store_blocked_counter === 15.U) {
       block_load_wakeup := true.B
@@ -1405,21 +1272,12 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   io.core.lxcpt.bits  := r_xcpt
 
   // Task 4: Speculatively wakeup loads 1 cycle before they come back
-  // Covers both load_incoming (normal AGU path) and load_retry (CMAP fast-path TLB retry).
-  // These two are mutually exclusive (they share the same TLB/DC port when memWidth=1).
-  val mem_spec_wakeup_uop = widthMap(w =>
-    Mux(fired_load_incoming(w), mem_incoming_uop(w),
-                                mem_ldq_retry_e.bits.uop))
-  val mem_spec_wakeup_ldq_idx = widthMap(w =>
-    Mux(fired_load_incoming(w), mem_incoming_uop(w).ldq_idx,
-                                RegNext(ldq_retry_idx)))
   for (w <- 0 until memWidth) {
-    io.core.spec_ld_wakeup(w).valid := enableFastLoadUse.B                        &&
-                                       fired_load_incoming(w)                     &&
-                                       !mem_spec_wakeup_uop(w).fp_val            &&
-                                       mem_spec_wakeup_uop(w).pdst =/= 0.U
-    io.core.spec_ld_wakeup(w).bits  := mem_spec_wakeup_uop(w).pdst
-    io.core.spec_ld_wakeup_is_retry(w) := false.B  // retry spec wakeup disabled
+    io.core.spec_ld_wakeup(w).valid := enableFastLoadUse.B          &&
+                                       fired_load_incoming(w)       &&
+                                       !mem_incoming_uop(w).fp_val  &&
+                                       mem_incoming_uop(w).pdst =/= 0.U
+    io.core.spec_ld_wakeup(w).bits  := mem_incoming_uop(w).pdst
   }
 
 
@@ -1541,7 +1399,7 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
   val spec_ld_succeed = widthMap(w =>
     !RegNext(io.core.spec_ld_wakeup(w).valid) ||
     (io.core.exe(w).iresp.valid &&
-      io.core.exe(w).iresp.bits.uop.ldq_idx === RegNext(mem_spec_wakeup_ldq_idx(w))
+      io.core.exe(w).iresp.bits.uop.ldq_idx === RegNext(mem_incoming_uop(w).ldq_idx)
     )
   ).reduce(_&&_)
   when (spec_ld_succeed) {
@@ -1794,9 +1652,9 @@ class LSU(implicit p: Parameters, edge: TLEdgeOut) extends BoomModule()(p)
       ldq(i).valid           := false.B
       ldq(i).bits.addr.valid := false.B
       ldq(i).bits.executed   := false.B
-    } 
+    }
   }
-  
+
   //-------------------------------------------------------------
   // Live Store Mask
   // track a bit-array of stores that are alive
